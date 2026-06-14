@@ -1,35 +1,40 @@
 // Package usaspending is the library behind the usaspending command line:
-// the HTTP client, request shaping, and the typed data models for usaspending.
+// the HTTP client, request shaping, and the typed data models for the
+// USASpending API (https://api.usaspending.gov/api/v2).
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// transient failures (429 and 5xx) that any public API throws under load.
 package usaspending
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to usaspending. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "usaspending/dev (+https://github.com/tamnd/usaspending-cli)"
+// DefaultUserAgent identifies the client to USASpending.gov. An honest
+// User-Agent is both polite and keeps you unblocked.
+const DefaultUserAgent = "usaspending-cli/0.1 (tamnd87@gmail.com)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at usaspending.com; change it once you
-// know the real endpoints you want to read.
-const Host = "usaspending.com"
+// Host is the API hostname this client talks to, and the host the URI driver
+// in domain.go claims.
+const Host = "api.usaspending.gov"
 
 // BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+const BaseURL = "https://api.usaspending.gov/api/v2"
 
-// Client talks to usaspending over HTTP.
+// Award type code groups.
+var (
+	contractCodes = []string{"A", "B", "C", "D"}
+	grantCodes    = []string{"02", "03", "04", "05"}
+)
+
+// Client talks to the USASpending API over HTTPS.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
@@ -40,68 +45,72 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults: a 30s timeout, a 300ms
+// minimum gap between requests, and three retries on transient errors.
 func NewClient() *Client {
 	return &Client{
 		HTTP:      &http.Client{Timeout: 30 * time.Second},
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      300 * time.Millisecond,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// post sends a POST request with a JSON body and decodes the JSON response
+// into out. It paces and retries according to the client's settings.
+func (c *Client) post(ctx context.Context, path string, body any, out any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return ctx.Err()
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		retry, err := c.doPost(ctx, path, data, out)
 		if err == nil {
-			return body, nil
+			return nil
 		}
 		lastErr = err
 		if !retry {
-			return nil, err
+			return err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return fmt.Errorf("post %s: %w", path, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) doPost(ctx context.Context, path string, data []byte, out any) (retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, BaseURL+path, bytes.NewReader(data))
 	if err != nil {
-		return nil, false, err
+		return false, err
 	}
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", c.UserAgent)
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, true, err
+		return true, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
+		return true, fmt.Errorf("http %d", resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
+		b, _ := io.ReadAll(resp.Body)
+		return false, fmt.Errorf("http %d: %s", resp.StatusCode, string(b))
 	}
 
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return false, fmt.Errorf("decode: %w", err)
 	}
-	return b, false, nil
+	return false, nil
 }
 
 // pace blocks until at least Rate has passed since the previous request.
@@ -123,78 +132,213 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on usaspending.com. It is a stand-in for the typed records you
-// will model from the real usaspending endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `usaspending cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// awardTypeCodes returns the API codes for "contract" or "grant".
+func awardTypeCodes(awardType string) []string {
+	if awardType == "grant" {
+		return grantCodes
+	}
+	return contractCodes
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
+// Award represents a single federal contract or grant award.
+type Award struct {
+	ID             string  `kit:"id" json:"id"`
+	Recipient      string  `json:"recipient"`
+	AwardingAgency string  `json:"awarding_agency"`
+	StartDate      string  `json:"start_date"`
+	Amount         float64 `json:"amount"`
+	AwardType      string  `json:"award_type"`
+}
+
+// Agency represents a federal agency and its obligated spending.
+type Agency struct {
+	ID        string  `kit:"id" json:"id"`
+	Name      string  `json:"name"`
+	Obligated float64 `json:"obligated_amount"`
+}
+
+// Recipient represents a top spending recipient.
+type Recipient struct {
+	Name   string  `kit:"id" json:"name"`
+	Amount float64 `json:"amount"`
+	ID     string  `json:"id"`
+}
+
+// SearchAwardsInput is the input for SearchAwards.
+type SearchAwardsInput struct {
+	Agency    string
+	Keyword   string
+	AwardType string // "contract" or "grant"
+	Year      string
+	Limit     int
+}
+
+// ListAgenciesInput is the input for ListAgencies.
+type ListAgenciesInput struct {
+	FY    string
+	Limit int
+}
+
+// TopRecipientsInput is the input for TopRecipients.
+type TopRecipientsInput struct {
+	Year      string
+	AwardType string // "contract" or "grant"
+	Limit     int
+}
+
+// SearchAwards searches federal awards (contracts or grants) via the
+// /search/spending_by_award/ endpoint.
+func (c *Client) SearchAwards(ctx context.Context, in SearchAwardsInput) ([]*Award, error) {
+	if in.Limit <= 0 {
+		in.Limit = 10
+	}
+	if in.Year == "" {
+		in.Year = "2024"
+	}
+
+	filters := map[string]any{
+		"award_type_codes": awardTypeCodes(in.AwardType),
+		"time_period": []map[string]string{
+			{"start_date": in.Year + "-01-01", "end_date": in.Year + "-12-31"},
+		},
+	}
+	if in.Agency != "" {
+		filters["agencies"] = []map[string]string{
+			{"type": "awarding", "tier": "toptier", "name": in.Agency},
+		}
+	}
+	if in.Keyword != "" {
+		filters["keywords"] = []string{in.Keyword}
+	}
+
+	reqBody := map[string]any{
+		"subawards": false,
+		"limit":     in.Limit,
+		"page":      1,
+		"filters":   filters,
+		"fields":    []string{"Award ID", "Recipient Name", "Start Date", "Award Amount", "Awarding Agency", "Award Type"},
+	}
+
+	var resp struct {
+		Results []map[string]any `json:"results"`
+	}
+	if err := c.post(ctx, "/search/spending_by_award/", reqBody, &resp); err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+
+	awards := make([]*Award, 0, len(resp.Results))
+	for _, r := range resp.Results {
+		a := &Award{}
+		if v, ok := r["Award ID"].(string); ok {
+			a.ID = v
+		}
+		if v, ok := r["Recipient Name"].(string); ok {
+			a.Recipient = v
+		}
+		if v, ok := r["Awarding Agency"].(string); ok {
+			a.AwardingAgency = v
+		}
+		if v, ok := r["Start Date"].(string); ok {
+			a.StartDate = v
+		}
+		if v, ok := r["Award Amount"].(float64); ok {
+			a.Amount = v
+		}
+		if v, ok := r["Award Type"].(string); ok {
+			a.AwardType = v
+		}
+		awards = append(awards, a)
+	}
+	return awards, nil
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
+// ListAgencies lists federal agencies and their obligated spending via the
+// /spending/ endpoint.
+func (c *Client) ListAgencies(ctx context.Context, in ListAgenciesInput) ([]*Agency, error) {
+	if in.Limit <= 0 {
+		in.Limit = 20
+	}
+	if in.FY == "" {
+		in.FY = "2024"
+	}
+
+	reqBody := map[string]any{
+		"type": "agency",
+		"filters": map[string]string{
+			"fy":      in.FY,
+			"quarter": "4",
+		},
+		"limit": in.Limit,
+	}
+
+	var resp struct {
+		Results []struct {
+			ID     string  `json:"id"`
+			Name   string  `json:"name"`
+			Amount float64 `json:"amount"`
+		} `json:"results"`
+	}
+	if err := c.post(ctx, "/spending/", reqBody, &resp); err != nil {
 		return nil, err
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+
+	agencies := make([]*Agency, 0, len(resp.Results))
+	for _, r := range resp.Results {
+		agencies = append(agencies, &Agency{
+			ID:        r.ID,
+			Name:      r.Name,
+			Obligated: r.Amount,
+		})
 	}
-	return out, nil
+	return agencies, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
+// TopRecipients returns the top spending recipients via the
+// /search/spending_by_category/recipient/ endpoint.
+func (c *Client) TopRecipients(ctx context.Context, in TopRecipientsInput) ([]*Recipient, error) {
+	if in.Limit <= 0 {
+		in.Limit = 10
+	}
+	if in.Year == "" {
+		in.Year = "2024"
+	}
 
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
+	reqBody := map[string]any{
+		"category": "recipient",
+		"limit":    in.Limit,
+		"filters": map[string]any{
+			"time_period": []map[string]string{
+				{"start_date": in.Year + "-01-01", "end_date": in.Year + "-12-31"},
+			},
+			"award_type_codes": awardTypeCodes(in.AwardType),
+		},
+	}
+
+	var resp struct {
+		Results []struct {
+			Name              string   `json:"name"`
+			AggregatedAmount  *float64 `json:"aggregated_amount"`
+			Amount            *float64 `json:"amount"`
+			ID                string   `json:"id"`
+		} `json:"results"`
+	}
+	if err := c.post(ctx, "/search/spending_by_category/recipient/", reqBody, &resp); err != nil {
+		return nil, err
+	}
+
+	recipients := make([]*Recipient, 0, len(resp.Results))
+	for _, r := range resp.Results {
+		rec := &Recipient{
+			Name: r.Name,
+			ID:   r.ID,
 		}
+		// aggregated_amount may be null; fall back to amount if set
+		if r.AggregatedAmount != nil {
+			rec.Amount = *r.AggregatedAmount
+		} else if r.Amount != nil {
+			rec.Amount = *r.Amount
+		}
+		recipients = append(recipients, rec)
 	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
+	return recipients, nil
 }
